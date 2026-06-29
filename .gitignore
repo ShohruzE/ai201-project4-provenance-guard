@@ -1,0 +1,78 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database migrations (often generated dynamically but shouldn't always be ignored)
+# migrations/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Flask instance folder (contains local configurations/uploads)
+instance/
+
+# Local configuration and secret files
+*.local
+.env
+.flaskenv
+secret_key.txt
+service_account.json
+
+# Cache directories
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.cache
+.webassets-cache/
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Logs
+logs/
+*.log
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
