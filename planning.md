@@ -1,366 +1,345 @@
-# Provenance Guard — Planning Document
+# Provenance Guard Planning Document
 
-## Architecture Narrative
+## Project Goal
 
-Here is the complete path a single piece of text takes from submission to the transparency label a user sees:
+Provenance Guard will be a small Flask backend that helps a creative writing platform explain whether a submitted text looks human-written, AI-generated, or too uncertain to label strongly. The goal is not to punish creators. The system should give readers useful context, avoid careless accusations, and give creators a clear appeal path.
 
-1. **Client submits text** via `POST /submit` with a JSON body containing the content (e.g., a poem, story excerpt, or blog post) and optional creator metadata.
+The first version will handle text only, such as poems, short stories, blog posts, and essays. Stretch features are not planned yet.
 
-2. **Rate Limiter** (Flask-Limiter middleware) checks whether the requesting IP/client has exceeded submission thresholds. If the limit is hit, the request is rejected with HTTP 429 before any analysis occurs.
+## Architecture
 
-3. **Input Validation** verifies the request body: text must be present, must be between 50 and 10,000 characters, and must be valid UTF-8. Malformed requests are rejected with HTTP 400.
+```text
+Submission flow
 
-4. **Detection Pipeline** receives the validated text and runs two independent signal analyzers in sequence:
-   - **Signal 1 — Lexical Diversity Analyzer**: Computes vocabulary richness metrics (type-token ratio, hapax legomena ratio) to measure how varied the word choices are.
-   - **Signal 2 — Burstiness Analyzer**: Measures the variance in sentence lengths and structural patterns to detect the uniformity characteristic of AI-generated text.
+Client
+  |
+  | POST /submit with raw text, creator_id, content_type
+  v
+Rate limiter
+  |
+  | allowed request
+  v
+Input validator
+  |
+  | cleaned text
+  v
+Detection pipeline
+  |
+  | text
+  +--> Signal 1: lexical diversity -> lexical_ai_score 0.0 to 1.0
+  |
+  +--> Signal 2: sentence burstiness -> burstiness_ai_score 0.0 to 1.0
+  |
+  v
+Confidence scorer
+  |
+  | combined_ai_score 0.0 to 1.0
+  v
+Label generator
+  |
+  | classification and exact label text
+  v
+Audit logger and in-memory store
+  |
+  | saved decision record
+  v
+JSON response to client
 
-5. **Confidence Scoring Engine** takes the two signal scores (each 0.0–1.0, where 1.0 = "strongly suggests AI") and combines them using a weighted average (Signal 1: 0.4, Signal 2: 0.6 — burstiness is weighted higher because it's more robust for creative text). The combined score represents overall confidence that the text is AI-generated.
 
-6. **Label Generator** maps the combined confidence score to one of three transparency label variants using asymmetric thresholds (the system requires stronger evidence to label content as AI than to label it as human, because false positives are more harmful on a creative platform):
-   - Score ≥ 0.85 → High-confidence AI label
-   - Score ≤ 0.30 → High-confidence Human label
-   - 0.30 < Score < 0.85 → Uncertain label
+Appeal flow
 
-7. **Audit Logger** writes a structured JSON entry capturing: submission ID, timestamp, raw text hash, both signal scores, combined confidence score, label assigned, and request metadata.
+Creator
+  |
+  | POST /appeal with submission_id, creator_id, reasoning
+  v
+Input validator
+  |
+  | valid appeal
+  v
+Submission lookup
+  |
+  | original decision found
+  v
+Status update to under_review
+  |
+  | appeal plus original decision
+  v
+Audit logger
+  |
+  | appeal record saved
+  v
+JSON confirmation to creator
+```
 
-8. **Response** is returned to the client as JSON containing: submission ID, classification result ("ai_generated", "human_written", or "uncertain"), confidence score, transparency label text, and timestamp.
+When text is submitted, the API validates it, runs two independent detection signals, combines their outputs into one AI-likelihood score, generates a reader-facing label, and logs the full decision. If a creator appeals, the system does not automatically reclassify the work. It marks the submission as `under_review`, stores the creator's explanation, and logs the appeal next to the original decision.
 
----
+## API Plan
 
-## Detection Signals
+### `POST /submit`
 
-### Signal 1: Lexical Diversity (Type-Token Ratio + Hapax Legomena)
+Accepts:
 
-**What it measures:**
-The ratio of unique words to total words (type-token ratio, or TTR) and the proportion of words that appear only once in the text (hapax legomena ratio). Together these capture how varied and "surprising" the vocabulary choices are throughout a piece of writing.
-
-**Why this property differs between human and AI writing:**
-AI language models draw from a probability distribution that favors common, "safe" word choices. They tend toward a comfortable middle — rarely using very obscure words but also avoiding the natural repetition patterns humans fall into. Human writers, especially creative ones, show more extreme distributions: either deploying highly specialized/unusual vocabulary (a poet reaching for a rare word) or exhibiting natural repetitive tics (a novelist who unconsciously overuses a favorite transition word). AI text produces a suspiciously *uniform* vocabulary distribution — not too rich, not too poor.
-
-**What it can't capture (blind spots):**
-- **Short texts** (under ~200 words) don't have enough tokens for meaningful statistical patterns.
-- **Non-native English speakers** may show constrained vocabulary that mimics AI patterns.
-- **Minimalist writers** (Hemingway-style) deliberately use restricted vocabulary and will appear AI-like.
-- **Heavily edited text** — a human who revises extensively may smooth out the natural irregularities that distinguish human writing.
-- **Domain-specific technical writing** reuses terminology by necessity, suppressing TTR regardless of origin.
-
----
-
-### Signal 2: Burstiness (Sentence Length Variance)
-
-**What it measures:**
-The statistical variance and coefficient of variation in sentence lengths across the entire text, along with the ratio of very short sentences (≤5 words) to very long ones (≥25 words). This captures the "rhythm" of writing — whether it flows in unpredictable bursts or maintains a steady cadence.
-
-**Why this property differs between human and AI writing:**
-Human writing is naturally "bursty." A writer will follow a 40-word complex sentence with a 4-word punch: "But it didn't work." This rhythmic irregularity emerges from the organic thought process of composition. AI models — especially instruction-tuned ones — produce remarkably uniform sentence structures. They tend toward medium-length sentences (12–20 words) with consistent clause patterns. Even when prompted to "vary your style," AI text shows measurably lower variance in sentence length than comparable human text.
-
-**What it can't capture (blind spots):**
-- **Academic/technical writing** often maintains uniformly long sentences regardless of human or AI origin.
-- **Poetry and experimental prose** deliberately manipulate rhythm, making the signal unreliable for these genres.
-- **AI text prompted with explicit style instructions** ("write with short punchy sentences mixed with long flowing ones") can artificially inflate burstiness.
-- **Very short texts** with fewer than 5–6 sentences don't provide enough data points for variance to be meaningful.
-- **List-heavy content** (blog posts with bullet points) will show artificial burstiness that isn't related to natural writing rhythm.
-
----
-
-## False Positive Analysis
-
-**Scenario:** A PhD researcher submits an original blog post about quantum computing. Their writing style is precise, methodical, and consistent — traits cultivated through years of academic training. They use domain vocabulary repeatedly (low TTR because "quantum," "superposition," and "decoherence" recur throughout) and maintain uniformly long, complex sentences (low burstiness because academic convention demands sustained argumentation).
-
-**How the system processes this:**
-
-1. **Signal 1 (Lexical Diversity):** TTR is low (~0.45) because of necessary domain term repetition. Hapax ratio is moderate. Signal score: **0.55** (mildly suggests AI).
-
-2. **Signal 2 (Burstiness):** Sentence length variance is low — most sentences are 20–35 words. Coefficient of variation is below the human baseline. Signal score: **0.70** (moderately suggests AI).
-
-3. **Combined Confidence:** (0.4 × 0.55) + (0.6 × 0.70) = 0.22 + 0.42 = **0.64**
-
-4. **Label Assignment:** 0.64 falls in the uncertain range (0.30 < score < 0.85). The system does NOT label this as AI-generated. Instead, the label says: *"We couldn't confidently determine this content's origin. Our analysis was inconclusive (confidence: 64%). The creator may request a review if they believe this assessment is inaccurate."*
-
-5. **What this gets right:** The asymmetric thresholds protect the human writer. Even though both signals lean toward "AI," the combined score of 0.64 is nowhere near the 0.85 threshold required to label content as AI-generated. The system defaults to uncertainty rather than making an accusation.
-
-6. **If the creator appeals:** They submit `POST /appeal` with their reasoning: "I am a quantum computing researcher and this is my original work. My academic writing style naturally uses repeated domain terminology and complex sentence structures." The system:
-   - Updates the submission status to `under_review`
-   - Logs the appeal in the audit log with the creator's reasoning alongside the original classification
-   - Returns confirmation that the appeal has been received
-   - A human reviewer can later examine the case
-
-**Design lesson this teaches:** The 0.85 threshold for AI labeling is deliberately high. The system should say "I don't know" far more often than it accuses a human of using AI. On a creative platform, being wrongly accused of plagiarism or AI use is deeply harmful — it's better to miss some AI content than to wrongly stigmatize human creators.
-
----
-
-## API Surface
-
-### POST /submit
-**Purpose:** Submit text content for AI/human attribution analysis.
-
-**Accepts:**
 ```json
 {
-  "content": "string (50–10000 chars, required)",
-  "creator_id": "string (optional, for tracking)",
-  "content_type": "string (optional: 'poem', 'story', 'blog', 'essay'; defaults to 'general')"
+  "content": "string, required, 50 to 10000 characters",
+  "creator_id": "string, optional",
+  "content_type": "poem | story | blog | essay | general, optional"
 }
 ```
 
-**Returns (200 OK):**
+Returns:
+
 ```json
 {
   "submission_id": "uuid",
-  "classification": "ai_generated | human_written | uncertain",
-  "confidence_score": 0.0-1.0,
+  "classification": "likely_ai | likely_human | uncertain",
+  "confidence_score": 0.87,
   "signals": {
-    "lexical_diversity": { "score": 0.0-1.0, "details": {} },
-    "burstiness": { "score": 0.0-1.0, "details": {} }
+    "lexical_diversity": {
+      "score": 0.82,
+      "details": {
+        "type_token_ratio": 0.41,
+        "hapax_ratio": 0.18
+      }
+    },
+    "burstiness": {
+      "score": 0.90,
+      "details": {
+        "average_sentence_length": 18.4,
+        "sentence_length_stdev": 3.1
+      }
+    }
   },
-  "transparency_label": "string (the user-facing label text)",
+  "transparency_label": "exact label text",
+  "status": "classified",
   "timestamp": "ISO 8601"
 }
 ```
 
-**Error responses:** 400 (invalid input), 429 (rate limited)
+### `POST /appeal`
 
----
+Accepts:
 
-### POST /appeal
-**Purpose:** Contest a classification decision.
-
-**Accepts:**
 ```json
 {
-  "submission_id": "uuid (required)",
-  "creator_id": "string (required)",
-  "reasoning": "string (required, 20–2000 chars)"
+  "submission_id": "uuid, required",
+  "creator_id": "string, required",
+  "reasoning": "string, required, 20 to 2000 characters"
 }
 ```
 
-**Returns (200 OK):**
+Returns:
+
 ```json
 {
   "appeal_id": "uuid",
   "submission_id": "uuid",
   "status": "under_review",
-  "message": "Your appeal has been received. The original classification has been marked for review.",
+  "message": "Your appeal has been received. This submission is now marked for human review.",
   "timestamp": "ISO 8601"
 }
 ```
 
-**Error responses:** 400 (invalid input), 404 (submission not found), 429 (rate limited)
+### `GET /audit-log`
 
----
+Returns recent classification and appeal events. Each entry should include the event type, submission ID, timestamp, score, signals, label, and appeal reasoning when present.
 
-### GET /submissions/<submission_id>
-**Purpose:** Retrieve a specific submission's classification result and current status.
+## Detection Signals
 
-**Returns (200 OK):**
+### Signal 1: Lexical Diversity
+
+This signal measures how varied the word choices are. It uses type-token ratio, which is unique words divided by total words, and hapax ratio, which is the share of words that appear only once.
+
+Output format:
+
 ```json
 {
+  "name": "lexical_diversity",
+  "score": 0.0,
+  "details": {
+    "type_token_ratio": 0.0,
+    "hapax_ratio": 0.0,
+    "word_count": 0
+  }
+}
+```
+
+The score is an AI-likelihood score from 0.0 to 1.0. A higher score means the vocabulary pattern looks more AI-like. For the first implementation, I will use these rough rules:
+
+- If word count is under 50, return `score: 0.50` because there is not enough text.
+- If type-token ratio is between `0.35` and `0.55` and hapax ratio is below `0.25`, return a higher AI score around `0.70` to `0.85`.
+- If type-token ratio is very high, above `0.70`, return a lower AI score around `0.20` to `0.35`.
+- If the values fall in the middle, return around `0.50`.
+
+This helps because AI writing often has smooth, safe vocabulary. It can miss minimalist human writers, non-native English writers, technical writing with repeated terms, and very short poems.
+
+### Signal 2: Sentence Burstiness
+
+This signal measures whether sentence lengths vary naturally. It calculates average sentence length, standard deviation, and coefficient of variation.
+
+Output format:
+
+```json
+{
+  "name": "burstiness",
+  "score": 0.0,
+  "details": {
+    "sentence_count": 0,
+    "average_sentence_length": 0.0,
+    "sentence_length_stdev": 0.0,
+    "coefficient_of_variation": 0.0
+  }
+}
+```
+
+The score is also an AI-likelihood score from 0.0 to 1.0. A higher score means the sentence rhythm looks more AI-like. For the first implementation, I will use these rough rules:
+
+- If there are fewer than 4 sentences, return `score: 0.50`.
+- If coefficient of variation is below `0.25`, return `0.80` to `0.95` because the sentences are very uniform.
+- If coefficient of variation is between `0.25` and `0.45`, return `0.45` to `0.70`.
+- If coefficient of variation is above `0.45`, return `0.15` to `0.35` because the rhythm is more varied.
+
+This helps because human writing often mixes short, medium, and long sentences. It can struggle with poetry, academic writing, bullet-heavy posts, and AI text that was prompted to vary its rhythm.
+
+### Combining the Signals
+
+Both signals return an AI-likelihood score from `0.0` to `1.0`. The combined score will use a weighted average:
+
+```text
+combined_ai_score = (lexical_score * 0.40) + (burstiness_score * 0.60)
+```
+
+Burstiness gets slightly more weight because sentence rhythm is harder to fake accidentally and works better for creative writing than vocabulary alone. The API will round the final score to two decimals for output, while keeping full precision inside the audit log.
+
+## Uncertainty Representation
+
+The confidence score means "how strongly the system thinks the content looks AI-generated." It is not a perfect probability. A score of `0.60` means the signals lean toward AI, but the system should not present that as a firm claim.
+
+Raw signal outputs are calibrated into the `0.0` to `1.0` range before they are combined. A score near `0.0` means strong human indicators, a score near `0.5` means weak or mixed evidence, and a score near `1.0` means strong AI indicators.
+
+The label thresholds will be:
+
+- `0.00` to `0.30`: `likely_human`
+- `0.31` to `0.84`: `uncertain`
+- `0.85` to `1.00`: `likely_ai`
+
+The AI threshold is intentionally high because a false positive can hurt a creator's reputation. A score of `0.51` and a score of `0.84` are both uncertain, but the label can still show the numeric AI-likelihood so readers understand the difference.
+
+## Transparency Label Design
+
+High-confidence AI result, used when `combined_ai_score >= 0.85`:
+
+> "Provenance Guard found strong signs that this content may have been AI-generated. AI-likelihood: {score}%. The creator can appeal this label if they believe it is wrong."
+
+High-confidence human result, used when `combined_ai_score <= 0.30`:
+
+> "Provenance Guard found strong signs that this content was written by a human. Human-likelihood: {human_score}%. No major AI-generation patterns were detected."
+
+Uncertain result, used when `0.30 < combined_ai_score < 0.85`:
+
+> "Provenance Guard could not confidently determine the origin of this content. AI-likelihood: {score}%. This label means the evidence is mixed, and the creator can request review."
+
+Before implementation, I should review these exact strings again and copy them into the README so the required label variants match the backend output.
+
+## Appeals Workflow
+
+Only the creator attached to a submission can submit an appeal. For this class project, that means the appeal request must include the same `creator_id` that was used on the original submission.
+
+The creator provides:
+
+- `submission_id`
+- `creator_id`
+- a written explanation between 20 and 2000 characters
+
+When the appeal is received, the system will:
+
+- check that the submission exists
+- check that the creator ID matches the submission
+- create an `appeal_id`
+- change the submission status from `classified` to `under_review`
+- store the appeal reasoning with the original classification, confidence score, signal details, and label text
+- add an audit log event with `event_type: "appeal"`
+
+A human reviewer opening the appeal queue would see the submission ID, creator ID, current status, original text preview, original label, combined score, both signal outputs, timestamp, and the creator's appeal reasoning. The reviewer would not need to guess why the system made the decision because the signal details would be visible.
+
+## Anticipated Edge Cases
+
+A short poem with repeated simple lines may look AI-generated because lexical diversity is low and sentence rhythm is repetitive. For example, a poem that repeats "I waited by the door" could be original human work but still score high on both signals.
+
+A technical blog post may reuse the same domain words many times. A human-written post about neural networks, climate modeling, or chemistry could have low vocabulary variety because the topic requires repeated terms.
+
+A polished college essay may have even sentence lengths after editing. If the writer revised it carefully, the burstiness signal may treat the smooth structure as AI-like.
+
+An AI text prompted to include fragments, slang, and uneven pacing may score more human than it should. The system should still log the signal details so the weakness is visible.
+
+## Rate Limiting and Audit Log Plan
+
+The `POST /submit` endpoint will allow `10 per minute` and `50 per hour` per IP address. This is enough for normal creators but slows down someone trying to test hundreds of tiny prompt changes.
+
+The `POST /appeal` endpoint will allow `3 per hour` per IP address. Appeals should be rare and thoughtful, so this still gives a creator room to contest multiple decisions.
+
+Each classification audit entry will include:
+
+```json
+{
+  "event_type": "classification",
   "submission_id": "uuid",
-  "classification": "ai_generated | human_written | uncertain",
-  "confidence_score": 0.0-1.0,
-  "transparency_label": "string",
-  "status": "classified | under_review | overturned",
-  "appeal": null | { "appeal_id": "uuid", "reasoning": "string", "submitted_at": "ISO 8601" },
-  "timestamp": "ISO 8601"
+  "timestamp": "ISO 8601",
+  "content_hash": "sha256 hash",
+  "classification": "likely_ai | likely_human | uncertain",
+  "confidence_score": 0.87,
+  "signals": {},
+  "label": "exact label text"
 }
 ```
 
----
+Each appeal audit entry will include:
 
-### GET /audit-log
-**Purpose:** Retrieve the structured audit log showing all classification decisions and appeals.
-
-**Query params:** `?limit=20&offset=0`
-
-**Returns (200 OK):**
 ```json
 {
-  "entries": [
-    {
-      "entry_id": "uuid",
-      "event_type": "classification | appeal | status_change",
-      "submission_id": "uuid",
-      "timestamp": "ISO 8601",
-      "details": {}
-    }
-  ],
-  "total_count": 42,
-  "limit": 20,
-  "offset": 0
+  "event_type": "appeal",
+  "appeal_id": "uuid",
+  "submission_id": "uuid",
+  "timestamp": "ISO 8601",
+  "previous_status": "classified",
+  "new_status": "under_review",
+  "reasoning": "creator explanation"
 }
 ```
 
----
+## AI Tool Plan
 
-## Architecture
+### M3: Submission Endpoint and First Signal
 
-### Submission Flow Diagram
+I will give the AI tool the `Architecture`, `API Plan`, and `Detection Signals` sections. I will ask it to generate a Flask app skeleton with `POST /submit`, request validation, in-memory submission storage, and the lexical diversity signal function.
 
-```mermaid
-flowchart TD
-    A[Client] -->|"POST /submit {content, creator_id}"| B[Rate Limiter]
-    B -->|"Request allowed"| C[Input Validator]
-    B -->|"429 Too Many Requests"| A
-    C -->|"Validated text"| D[Detection Pipeline]
-    C -->|"400 Bad Request"| A
+I will verify the output by calling the lexical diversity function directly with a short repeated text, a varied human-style paragraph, and a smooth AI-style paragraph. I will check that the function returns the required JSON shape and that the score changes instead of staying fixed.
 
-    D --> E[Signal 1: Lexical Diversity Analyzer]
-    D --> F[Signal 2: Burstiness Analyzer]
+### M4: Second Signal and Confidence Scoring
 
-    E -->|"lexical_score: 0.0–1.0"| G[Confidence Scoring Engine]
-    F -->|"burstiness_score: 0.0–1.0"| G
+I will give the AI tool the `Architecture`, `Detection Signals`, and `Uncertainty Representation` sections. I will ask it to add the sentence burstiness function and the weighted scoring logic.
 
-    G -->|"combined_score: 0.0–1.0"| H[Label Generator]
+I will verify this milestone by testing clearly uniform text, clearly varied text, and a mixed example. The scores should move across the range, and at least one test should reach each general area: likely human, uncertain, and likely AI.
 
-    H -->|"score ≥ 0.85 → AI label"| I[Audit Logger]
-    H -->|"score ≤ 0.30 → Human label"| I
-    H -->|"0.30 < score < 0.85 → Uncertain label"| I
+### M5: Production Layer
 
-    I -->|"Structured log entry written"| J[Response Builder]
-    J -->|"JSON: {submission_id, classification, confidence, label}"| A
-```
+I will give the AI tool the `Architecture`, `Transparency Label Design`, `Appeals Workflow`, and `Rate Limiting and Audit Log Plan` sections. I will ask it to add label generation, the `POST /appeal` endpoint, rate limiting, and structured audit logging.
 
-### Appeal Flow Diagram
+I will verify this milestone by forcing scores that hit all three label variants, submitting an appeal for a real submission ID, checking that the status becomes `under_review`, and confirming that the audit log contains both the original classification and the appeal.
 
-```mermaid
-flowchart TD
-    A[Creator] -->|"POST /appeal {submission_id, creator_id, reasoning}"| B[Rate Limiter]
-    B -->|"Request allowed"| C[Input Validator]
-    B -->|"429 Too Many Requests"| A
-    C -->|"400 Bad Request"| A
-    C -->|"Validated appeal data"| D[Submission Lookup]
-    D -->|"404 Not Found"| A
-    D -->|"Original submission found"| E[Status Updater]
-    E -->|"status → under_review"| F[Audit Logger]
-    F -->|"Appeal event logged with original decision + reasoning"| G[Response Builder]
-    G -->|"JSON: {appeal_id, status: under_review, message}"| A
-```
+## Planned File Structure
 
-### Component Interaction Summary
-
-```mermaid
-graph LR
-    subgraph "API Layer"
-        POST_SUBMIT[POST /submit]
-        POST_APPEAL[POST /appeal]
-        GET_SUB[GET /submissions/:id]
-        GET_LOG[GET /audit-log]
-    end
-
-    subgraph "Middleware"
-        RL[Rate Limiter]
-        IV[Input Validator]
-    end
-
-    subgraph "Core Engine"
-        DP[Detection Pipeline]
-        S1[Lexical Diversity]
-        S2[Burstiness]
-        CS[Confidence Scorer]
-        LG[Label Generator]
-    end
-
-    subgraph "Storage"
-        DB[(In-Memory Store)]
-        AL[(Audit Log)]
-    end
-
-    POST_SUBMIT --> RL --> IV --> DP
-    DP --> S1 --> CS
-    DP --> S2 --> CS
-    CS --> LG --> AL --> DB
-
-    POST_APPEAL --> RL --> IV --> DB
-    GET_SUB --> DB
-    GET_LOG --> AL
-```
-
----
-
-## Transparency Label Variants
-
-### High-Confidence AI (score ≥ 0.85)
-> "⚠️ AI-Generated Content — Our analysis indicates this content was likely produced by an AI system (confidence: {score}%). Readers should consider this context when evaluating the work. The creator may appeal this classification."
-
-### High-Confidence Human (score ≤ 0.30)
-> "✓ Original Human Work — Our analysis indicates this content was written by a human (confidence: {100 - score}%). No significant indicators of AI generation were detected."
-
-### Uncertain (0.30 < score < 0.85)
-> "? Inconclusive — We couldn't confidently determine this content's origin (confidence: {score}% AI-likelihood). Our analysis was not definitive. The creator may request a review if they believe this assessment is inaccurate."
-
----
-
-## Rate Limiting Strategy
-
-**Submission endpoint (`POST /submit`):** 10 requests per minute, 50 per hour per IP.
-
-**Reasoning:**
-- A legitimate creator on a writing platform submits work infrequently — maybe 2–5 pieces per day. Even a power user wouldn't need more than 10 analyses per minute.
-- An adversary trying to reverse-engineer detection thresholds would need hundreds of rapid submissions with slight text variations. 10/min makes this tedious without blocking legitimate use.
-- The hourly cap (50) prevents sustained automated probing over longer periods.
-
-**Appeal endpoint (`POST /appeal`):** 3 per hour per IP.
-
-**Reasoning:**
-- Appeals are rare, deliberate actions. A creator might appeal 1–2 classifications per day at most.
-- Limiting to 3/hour prevents abuse of the appeal system while ensuring a legitimate creator who received multiple unfair classifications can still contest them.
-
-**Read endpoints (`GET /submissions/:id`, `GET /audit-log`):** 30 per minute per IP.
-
-**Reasoning:**
-- Read operations are cheap and users may paginate through results.
-- Higher limit since these don't trigger computation.
-
----
-
-## Confidence Scoring Design Philosophy
-
-The confidence score is a **design decision** before it is a technical one:
-
-- **0.0** means "we are certain this is human-written"
-- **0.5** means "we genuinely have no idea — the signals are contradictory or insufficient"
-- **1.0** means "we are certain this is AI-generated"
-
-The score is NOT a probability in the statistical sense — it's a communication tool. When we say "confidence: 64% AI-likelihood," we're telling the user: "our signals lean toward AI, but not strongly enough for us to stake a claim."
-
-**Asymmetric thresholds reflect asymmetric harm:**
-- Labeling a human's work as AI (false positive) → damages their reputation, undermines their creative identity
-- Missing AI content (false negative) → less harmful; the content just goes unlabeled
-
-Therefore: the system requires overwhelming evidence (0.85+) to label something as AI, but only moderate evidence (0.30 or below) to affirm it as human. The wide "uncertain" band (0.30–0.85) is intentional — the system says "I don't know" far more often than it accuses.
-
----
-
-## Technology Stack
-
-- **Framework:** Flask (lightweight, appropriate for API-focused service)
-- **Rate Limiting:** Flask-Limiter (Redis-backed in production, in-memory for development)
-- **Storage:** In-memory data structures (dict-based) for this prototype; production would use PostgreSQL
-- **Audit Log:** JSON-structured entries stored in-memory, accessible via GET endpoint
-- **Text Analysis:** Pure Python with standard library (re, collections, statistics) — no ML model dependencies for the two core signals
-- **Optional AI Signal:** Groq API for a third ensemble signal (stretch goal)
-
----
-
-## File Structure (Planned)
-
-```
+```text
 provenance-guard/
-├── app.py                  # Flask application factory & route definitions
-├── detection/
-│   ├── __init__.py
-│   ├── pipeline.py         # Orchestrates signals and scoring
-│   ├── lexical.py          # Signal 1: Lexical diversity analysis
-│   ├── burstiness.py       # Signal 2: Sentence structure variance
-│   └── confidence.py       # Weighted scoring and label generation
-├── models/
-│   ├── __init__.py
-│   └── store.py            # In-memory data store for submissions & appeals
-├── audit/
-│   ├── __init__.py
-│   └── logger.py           # Structured audit logging
-├── planning.md
-├── README.md
-├── requirements.txt
-└── .gitignore
+  app.py
+  detection/
+    __init__.py
+    lexical.py
+    burstiness.py
+    scoring.py
+  storage.py
+  audit.py
+  planning.md
+  README.md
+  requirements.txt
 ```
